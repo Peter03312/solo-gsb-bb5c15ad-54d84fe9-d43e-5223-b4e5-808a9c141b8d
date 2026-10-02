@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
+from . import arrangement as arrangement_svc, changes, db, field_packages as field_packages_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -35,7 +35,10 @@ app = FastAPI(
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
-        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）。"
+        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）；"
+        "支持野外终端整包汇入（/field-packages）：短号对照随包建立或校验站点一致、"
+        "终端短号跨包不可改绑、证据编号由终端/包号/序号稳定确定，整包核验原子落库，"
+        "同终端同包号同内容重试幂等返回原结果。"
     ),
     lifespan=lifespan,
 )
@@ -355,3 +358,45 @@ def merge_projection(projection_id: int):
 def discard_projection(projection_id: int):
     """放弃推演（仅 open 可放弃，放弃后不可并入）。"""
     return projections.discard_projection(projection_id)
+
+
+# ------------------------------------------------------------------ 野外终端整包汇入
+@app.post("/field-packages", tags=["field-packages"])
+def post_field_package(body: FieldPackageIn):
+    """野外终端整包汇入：把离线采集的一包短号关系原子汇入正式库。
+
+    - 请求携带采集站点、终端编号、包号、预期正式修订号、短号 -> 全库地层编号对照，
+      以及带包内唯一序号的同一期 / 早于断言；断言端点只能引用本包对照中的短号；
+    - 对照目标已登记时站点须一致（409 SITE_CONFLICT），未登记时随包建立；
+      同一终端的同一短号跨包不可改绑（409 SHORT_CODE_REBIND）；
+    - 证据编号由终端、包号、包内序号稳定确定（FT-{终端}-{包号}-{序号}），
+      不得占用已有编号（409 DUPLICATE_EVIDENCE）；
+    - 整包沿用正式批次的最终关系核验，冲突返回证据路径（409 CONFLICT）；
+      未知短号（400 UNKNOWN_SHORT_CODE）、重复序号（400 DUPLICATE_SEQUENCE）、
+      修订号过期（409 STALE_REVISION）明确报错；
+    - 任一错误都不落地层、绑定或断言；成功只递增一次正式修订号，
+      并与关系变化记录同事务提交（来源 field_ingest）；
+    - 相同终端 + 包号 + 内容重试返回原结果（HTTP 200，replayed=true，
+      即使正式修订已前进）；同终端同包号异内容复用拒绝
+      （409 PACKAGE_CONTENT_MISMATCH）。首次汇入 HTTP 201。
+    """
+    payload, created = field_packages_svc.ingest_field_package(body)
+    return JSONResponse(status_code=201 if created else 200, content=payload)
+
+
+@app.get("/field-packages", tags=["field-packages"])
+def list_field_packages():
+    """已汇入包列表（不含请求 / 结果明细）。"""
+    return field_packages_svc.list_field_packages()
+
+
+@app.get("/field-packages/{terminal_id}/{package_no}", tags=["field-packages"])
+def get_field_package(terminal_id: str, package_no: str):
+    """已汇入包详情：原始请求、落库结果（短号映射、证据编号、修订号）与内容指纹。"""
+    return field_packages_svc.get_field_package(terminal_id, package_no)
+
+
+@app.get("/terminals/{terminal_id}/short-codes", tags=["field-packages"])
+def list_terminal_short_codes(terminal_id: str):
+    """某终端的短号 -> 全库地层编号绑定清单（跨包稳定，不可改绑）。"""
+    return field_packages_svc.list_short_code_bindings(terminal_id)

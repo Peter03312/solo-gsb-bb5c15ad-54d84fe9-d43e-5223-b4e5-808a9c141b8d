@@ -107,6 +107,47 @@ class ArrangementIn(BaseModel):
     )
 
 
+class FieldStrataMapEntry(BaseModel):
+    """短号对照项：终端包内短号 -> 全库地层编号。"""
+
+    short_code: str = Field(min_length=1, max_length=64, description="终端包内短号（本包对照内唯一）")
+    stratum_id: str = Field(min_length=1, max_length=128, description="对照的全库地层编号")
+
+
+class FieldAssertionIn(BaseModel):
+    """包内断言：端点只能引用本包对照中的短号；relation=earlier_than 表示 short_a 早于 short_b。"""
+
+    seq: int = Field(
+        ge=1,
+        le=999999999,
+        description="包内唯一序号；证据编号由终端、包号、序号稳定确定",
+    )
+    short_a: str = Field(min_length=1, max_length=64, description="端点 A 的包内短号")
+    short_b: str = Field(min_length=1, max_length=64, description="端点 B 的包内短号")
+    relation: Literal["same_period", "earlier_than"]
+
+
+class FieldPackageIn(BaseModel):
+    """野外终端整包汇入请求。
+
+    整包原子汇入：任一错误（未知短号 / 重复序号 / 站点冲突 / 短号改绑 / 证据编号占用 /
+    修订号过期 / 关系冲突）都不落地层、绑定或断言；成功只递增一次正式修订号，
+    并与关系变化记录同事务提交。相同终端 + 包号 + 内容的重试返回原结果（幂等），
+    相同终端 + 包号但内容不同的复用拒绝。
+    """
+
+    site: str = Field(min_length=1, max_length=256, description="采集站点")
+    terminal_id: str = Field(min_length=1, max_length=48, description="终端编号")
+    package_no: str = Field(min_length=1, max_length=48, description="包号（终端内唯一）")
+    expected_revision: int = Field(ge=0, description="预期的当前正式修订号；不一致则整包拒绝")
+    strata_map: List[FieldStrataMapEntry] = Field(
+        min_length=1, description="短号到全库地层编号的对照（至少一项，短号包内唯一）"
+    )
+    assertions: List[FieldAssertionIn] = Field(
+        min_length=1, description="带包内唯一序号的同一期 / 早于断言（至少一条）"
+    )
+
+
 class ResilienceIn(BaseModel):
     """证据撤回承受力分析请求（只读，不写库、不递增修订号、不产生变化记录）。
 

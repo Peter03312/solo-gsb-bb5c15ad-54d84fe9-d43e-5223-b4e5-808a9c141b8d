@@ -1,7 +1,7 @@
 """正式修订关系变化追踪。
 
-对每次**成功的正式断言批次**及**推演并入产生的正式修订**，记录本修订提交前后
-有变化的地层对（同一对按地层编号固定顺序只列一次）：
+对每次**成功的正式断言批次**、**推演并入产生的正式修订**及**野外终端整包汇入**，
+记录本修订提交前后有变化的地层对（同一对按地层编号固定顺序只列一次）：
 
 - 关系（含方向：same_period / earlier_than / later_than）发生变化；
 - 关系不变但最优支撑证据路径发生变化（路径选取规则沿用 derivation：
@@ -9,7 +9,7 @@
 - 变为未定（undetermined）时证据路径为空数组。
 
 记录在提交事务内与断言落库、修订号递增原子写入，因此：
-- 失败批次、推演内编辑、无净变更并入（不产生正式修订号）不产生变化记录；
+- 失败批次、推演内编辑、无净变更并入、汇入失败（不产生正式修订号）不产生变化记录；
 - 并发提交时不可能读到“半批结果”，也不会漏项或重复。
 
 历史可追溯性：旧侧关系与路径均按**该修订提交前**的当时状态推导。后来才被
@@ -118,9 +118,9 @@ def backfill_revision_changes(cur) -> int:
 
     以每个历史修订为界：地层取截至该修订提交时刻已登记的；
     旧侧断言集取上一修订时刻（最早修订取空集），新侧取本修订时刻。
-    source 尽量按当时审计记录还原（推演并入的 batch 带 source=projection_merge），
-    其余为正式批次。在线提交与启动回填都写 revision_changes_sealed 封口标记，
-    故不重复。
+    source 尽量按当时审计记录还原（推演并入的 batch 带 source=projection_merge，
+    野外终端整包汇入带 source=field_ingest），其余为正式批次。
+    在线提交与启动回填都写 revision_changes_sealed 封口标记，故不重复。
     """
     # 锁定修订计数器，回填与在线提交互斥（启动阶段实际无并发，双保险）
     cur.execute("SELECT revision FROM revision_counter WHERE id = TRUE FOR UPDATE")
@@ -142,7 +142,8 @@ def backfill_revision_changes(cur) -> int:
         after_assertions = _active_assertions_at(cur, revision)
         strata = [s for s, created in strata_created.items() if created <= applied_at]
         diffs = relation_diffs(strata, before_assertions, after_assertions)
-        source = "projection_merge" if isinstance(batch, dict) and batch.get("source") == "projection_merge" else "formal_batch"
+        audit_source = batch.get("source") if isinstance(batch, dict) else None
+        source = audit_source if audit_source in ("projection_merge", "field_ingest") else "formal_batch"
         insert_revision_changes(cur, revision, diffs, source)
         prev_revision = revision
     return len(pending)

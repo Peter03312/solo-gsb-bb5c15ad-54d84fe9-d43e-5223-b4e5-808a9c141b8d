@@ -125,8 +125,8 @@ CREATE TABLE IF NOT EXISTS revision_changes (
     -- 当时的最优支撑证据路径；关系未定（含变为未定）时为空数组 []
     old_path     JSONB NOT NULL,
     new_path     JSONB NOT NULL,
-    -- formal_batch=正式断言批次；projection_merge=推演并入（历史回填时来源按审计还原）
-    source       TEXT NOT NULL CHECK (source IN ('formal_batch', 'projection_merge')),
+    -- formal_batch=正式断言批次；projection_merge=推演并入；field_ingest=野外终端整包汇入
+    source       TEXT NOT NULL CHECK (source IN ('formal_batch', 'projection_merge', 'field_ingest')),
     PRIMARY KEY (revision, seq),
     UNIQUE (revision, stratum_a, stratum_b)
 );
@@ -160,6 +160,40 @@ CREATE TABLE IF NOT EXISTS thematic_packages (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (version, strata_key)
 );
+
+-- 野外终端短号绑定：同一终端的同一短号跨包稳定绑定同一全库地层，不可改绑。
+-- 绑定随首个成功汇入的包建立；任一汇入失败整体回滚，不留半绑定。
+CREATE TABLE IF NOT EXISTS terminal_short_codes (
+    terminal_id  TEXT NOT NULL,
+    short_code  TEXT NOT NULL,
+    stratum_id  TEXT NOT NULL REFERENCES strata(stratum_id),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, short_code)
+);
+
+-- 野外终端整包汇入登记：同一 (终端, 包号) 只成功落库一次。
+-- content_hash 为规范化请求内容指纹：同内容重试幂等返回原结果（即使正式修订
+-- 已前进），异内容复用拒绝。只有成功汇入才登记，失败请求不占用包号。
+CREATE TABLE IF NOT EXISTS field_ingest_packages (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    terminal_id  TEXT NOT NULL,
+    package_no   TEXT NOT NULL,
+    site         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    request      JSONB NOT NULL,
+    revision     INTEGER NOT NULL,                       -- 本包落库的正式修订号
+    result       JSONB NOT NULL,                         -- 首次汇入的响应内容（重试原样返回）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (terminal_id, package_no)
+);
+"""
+
+# 既有部署的幂等迁移：revision_changes.source 检查约束扩展 field_ingest 来源。
+# CREATE TABLE IF NOT EXISTS 不会更新已存在表的约束，故在此显式替换（新库重放无害）。
+MIGRATIONS = """
+ALTER TABLE revision_changes DROP CONSTRAINT IF EXISTS revision_changes_source_check;
+ALTER TABLE revision_changes ADD CONSTRAINT revision_changes_source_check
+    CHECK (source IN ('formal_batch', 'projection_merge', 'field_ingest'));
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
@@ -177,6 +211,7 @@ def init_pool(retries: int = 30, delay: float = 1.0) -> None:
                 with conn:
                     with conn.cursor() as cur:
                         cur.execute(SCHEMA)
+                        cur.execute(MIGRATIONS)
                         # 启动幂等回填部署前历史修订的变化记录（“已有历史修订也应可追溯”）
                         from .changes import backfill_revision_changes
 

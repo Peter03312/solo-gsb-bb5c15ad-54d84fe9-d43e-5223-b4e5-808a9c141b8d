@@ -19,6 +19,14 @@
   复核包：只含按编号排序的无序两两关系，结论与最优路径同该定版查询，确定结论携带
   路径按序原始断言，途经未入选地层随证据保留但不扩展关系，未定不附路径；同一定版 +
   同一地层集合（顺序无关）只封存一份，撤回 / 新修订 / 新定版均不改变包内容。
+- **野外终端整包汇入**：野外终端离线以包内短号记录关系，回站后整包一次汇入
+  （`POST /field-packages`）：请求携带采集站点、终端编号、包号、预期正式修订号、
+  短号 -> 全库地层编号对照与带包内唯一序号的断言（端点只能引用本包短号）；
+  对照目标已登记时站点须一致，未登记时随包建立；同一终端的同一短号跨包不可改绑；
+  证据编号由终端、包号、序号稳定确定（`FT-{终端}-{包号}-{序号}`）且不得占用已有编号；
+  整包沿用正式批次的最终关系核验，冲突返回证据路径；任一错误都不落地层、绑定或断言；
+  成功只递增一次正式修订号并与变化记录同事务提交（来源 `field_ingest`）；
+  相同终端 + 包号 + 内容重试返回原结果（即使正式修订已前进），异内容复用拒绝。
 - **修订变化追踪**：对每次成功的正式断言批次及推演并入产生的正式修订，记录提交前后
   关系结论或最优支撑路径发生变化的地层对；同一对按地层编号固定顺序只列一次；
   关系不变但最优路径改变也记录；变为未定时路径为空。记录与批次同事务原子写入，
@@ -121,6 +129,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/projections/{id}` | 放弃推演（仅 open 可放弃） |
 | POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
 | GET | `/packages` / `/packages/{id}` | 成果包列表 / 成果包详情（冻结内容与内容指纹） |
+| POST | `/field-packages` | 野外终端整包汇入：短号对照 + 带序号断言整包原子落库 `{site, terminal_id, package_no, expected_revision, strata_map[], assertions[]}` |
+| GET | `/field-packages` / `/field-packages/{terminal_id}/{package_no}` | 已汇入包列表 / 包详情（原始请求、落库结果、内容指纹） |
+| GET | `/terminals/{terminal_id}/short-codes` | 终端短号 -> 全库地层编号绑定清单 |
 
 ### 批次请求格式
 
@@ -531,12 +542,20 @@ bash examples/arrangement_demo.sh
 | 400 | `NOT_ENOUGH_STRATA` | 成果包：少于两个地层编号 |
 | 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 / 分期试排：锚点地层重复 |
 | 404 | `PACKAGE_NOT_FOUND` | 成果包不存在 |
+| 400 | `UNKNOWN_SHORT_CODE` | 整包汇入：断言引用本包对照之外的短号 |
+| 400 | `DUPLICATE_SEQUENCE` | 整包汇入：包内断言序号重复 |
+| 400 | `DUPLICATE_SHORT_CODE` | 整包汇入：短号对照内短号重复 |
+| 409 | `SITE_CONFLICT` | 整包汇入：对照目标已登记且站点与包站点不一致 |
+| 409 | `SHORT_CODE_REBIND` | 整包汇入：同一终端同一短号跨包改绑 |
+| 409 | `PACKAGE_CONTENT_MISMATCH` | 整包汇入：同终端同包号异内容复用 |
+| 404 | `FIELD_PACKAGE_NOT_FOUND` | 汇入包不存在 |
 
 ## 正式修订关系变化追踪
 
 考古人员需要按正式修订追踪**关系结论及支撑证据**的变化。服务对每次成功的
-**正式断言批次**（`POST /batches`）与**推演并入产生的正式修订**
-（`POST /projections/{id}/merge` 且实际递增修订号）记录变化明细。
+**正式断言批次**（`POST /batches`）、**推演并入产生的正式修订**
+（`POST /projections/{id}/merge` 且实际递增修订号）与**野外终端整包汇入**
+（`POST /field-packages` 首次成功落库）记录变化明细。
 
 **记录口径**
 
@@ -550,6 +569,7 @@ bash examples/arrangement_demo.sh
 - **失败批次不产生记录**（整批拒绝、原状态不变、修订号不增）；
   **推演内编辑不产生正式记录**（只动 `projection_*` 表）；
   **无净变更并入不产生记录**（只关闭推演、不递增正式修订号）；
+  **汇入失败与同内容重试不产生记录**（整包回滚或幂等返回，不递增正式修订号）；
 - 成功修订也可能零变化（如撤回一条从未进入最优路径的平行断言）：修订号照常递增、
   审计与封口照写，但没有变化行。
 
@@ -594,12 +614,12 @@ bash examples/arrangement_demo.sh
 ```
 
 `source`：`formal_batch`（正式断言批次）/ `projection_merge`（推演并入产生的
-正式修订）。
+正式修订）/ `field_ingest`（野外终端整包汇入）。
 
 **历史修订可追溯**：服务启动时幂等检查 `revisions` 审计，对部署前已存在、尚未
 追踪的历史修订按当时断言集（`added_revision` / `retracted_revision` 回放）重算
-旧/新关系与最优路径并回填；推演并入的历史修订 `source` 按审计记录还原为
-`projection_merge`。再次启动不会重复（按修订封口）。
+旧/新关系与最优路径并回填；推演并入与整包汇入的历史修订 `source` 按审计记录
+还原为 `projection_merge` / `field_ingest`。再次启动不会重复（按修订封口）。
 
 ```bash
 # 首屏
@@ -777,6 +797,104 @@ curl -X POST "$BASE/packages" -H 'Content-Type: application/json' \
 bash examples/packages_demo.sh
 ```
 
+## 野外终端整包汇入
+
+野外终端离线期间以**包内短号**记录地层关系，回站后把整包一次性汇入正式库
+（`POST /field-packages`）。整包是一个原子单位：任一错误都不落地层、短号绑定
+或断言；成功只递增一次正式修订号，并与关系变化记录同事务提交。
+
+**请求口径**
+
+- `site`（采集站点）、`terminal_id`（终端编号）、`package_no`（包号，终端内唯一）、
+  `expected_revision`（预期正式修订号）；
+- `strata_map[]`：短号 -> 全库地层编号对照（至少一项，短号在本包对照内唯一）；
+- `assertions[]`：每条带**包内唯一序号** `seq`（≥1）与 `relation`
+  （`same_period` / `earlier_than`，后者表示 `short_a` 早于 `short_b`）；
+  **断言端点只能引用本包对照中的短号**。
+
+**落库规则**
+
+- 对照目标**已登记**时站点须与包站点一致（登记站点为空的与任何包站点都不一致），
+  否则 409 `SITE_CONFLICT`；**未登记**时随包以包站点建立地层；
+- 同一终端的同一短号**跨包不可改绑**：首次汇入建立 `(终端, 短号) -> 地层` 绑定，
+  后续包的对照须与既有绑定一致，否则 409 `SHORT_CODE_REBIND`（一致时复用绑定）；
+- 证据编号由终端、包号、包内序号**稳定确定**：`FT-{terminal_id}-{package_no}-{seq}`；
+  该编号不得占用已有证据编号（含已撤回，如被正式批次先行占用），否则
+  409 `DUPLICATE_EVIDENCE`；
+- 整包沿用**正式批次的最终关系核验**（组内早于 / 早于闭环），冲突返回证据路径
+  （409 `CONFLICT`，`details.conflicts[].evidence_path` 含本包推导出的证据编号）；
+- 成功只**递增一次**正式修订号，变化记录来源为 `field_ingest`
+  （可在 `/revision-changes` 追踪）；随包建立的地层参与当次变化计算。
+
+**幂等与复用**
+
+- 只有**成功**汇入才登记包（失败请求不占用包号，修正后可同包号重发）；
+- 相同终端 + 包号 + **相同内容**的重试返回**原结果**（HTTP 200、`replayed=true`、
+  原修订号与原证据编号），即使正式修订已前进——不重复落库、不重复递增；
+  内容按规范化后的完整请求（含预期修订号）取指纹，对照 / 断言条目书写顺序无关；
+- 相同终端 + 包号但**内容不同**的复用拒绝（409 `PACKAGE_CONTENT_MISMATCH`）。
+
+**明确报错**：未知短号（400 `UNKNOWN_SHORT_CODE`，`details.unknown_short_codes`）、
+包内序号重复（400 `DUPLICATE_SEQUENCE`）、对照短号重复（400 `DUPLICATE_SHORT_CODE`）、
+站点冲突（409 `SITE_CONFLICT`）、短号改绑（409 `SHORT_CODE_REBIND`）、
+证据编号占用（409 `DUPLICATE_EVIDENCE`）、修订号过期（409 `STALE_REVISION`）、
+关系冲突（409 `CONFLICT` 附证据路径）。
+
+### 汇入请求与响应
+
+```bash
+curl -X POST "$BASE/field-packages" -H 'Content-Type: application/json' -d '{
+  "site": "甲遗址",
+  "terminal_id": "T-DEMO",
+  "package_no": "PKG-1",
+  "expected_revision": 1,
+  "strata_map": [
+    {"short_code": "A", "stratum_id": "F1"},
+    {"short_code": "B", "stratum_id": "F4"},
+    {"short_code": "C", "stratum_id": "F2"}
+  ],
+  "assertions": [
+    {"seq": 1, "short_a": "A", "short_b": "B", "relation": "same_period"},
+    {"seq": 2, "short_a": "B", "short_b": "C", "relation": "earlier_than"}
+  ]}'
+```
+
+首次汇入 HTTP **201**（`F1`/`F2` 已登记且站点一致，`F4` 未登记随包建立）：
+
+```json
+{
+  "terminal_id": "T-DEMO",
+  "package_no": "PKG-1",
+  "site": "甲遗址",
+  "revision": 2,
+  "applied": 2,
+  "relation_changes": 2,
+  "strata_map": [
+    {"short_code": "A", "stratum_id": "F1", "stratum_created": false, "binding_created": true},
+    {"short_code": "B", "stratum_id": "F4", "stratum_created": true, "binding_created": true},
+    {"short_code": "C", "stratum_id": "F2", "stratum_created": false, "binding_created": true}
+  ],
+  "evidence": [
+    {"seq": 1, "evidence_id": "FT-T-DEMO-PKG-1-1", "stratum_a": "F1", "stratum_b": "F4", "relation": "same_period"},
+    {"seq": 2, "evidence_id": "FT-T-DEMO-PKG-1-2", "stratum_a": "F4", "stratum_b": "F2", "relation": "earlier_than"}
+  ],
+  "replayed": false
+}
+```
+
+同内容重试返回 HTTP **200** 与原结果（`replayed: true`、`revision` 仍为 2）；
+`GET /field-packages` 列出已汇入包，`GET /field-packages/{terminal_id}/{package_no}`
+返回原始请求、落库结果与内容指纹，`GET /terminals/{terminal_id}/short-codes`
+返回该终端的短号绑定清单。
+
+完整端到端演示（正常汇入、修订前进后同内容重试、异内容复用拒绝、跨包改绑、
+站点冲突、未知短号 / 重复序号 / 过期修订、关系冲突整包回滚、证据编号占用、
+包查询与 `field_ingest` 变化记录）：
+
+```bash
+bash examples/field_packages_demo.sh
+```
+
 ## 调用示例
 
 端到端 curl 演示（覆盖登记、批次、推导查询、冲突拒绝、撤回、定版与旧版不可变）：
@@ -835,6 +953,14 @@ bash examples/changes_demo.sh
 bash examples/packages_demo.sh
 ```
 
+野外终端整包汇入演示（正常汇入与随包建层、同内容重试幂等、异内容复用拒绝、
+跨包改绑 / 站点冲突 / 未知短号 / 重复序号 / 过期修订、关系冲突整包回滚、
+证据编号占用、包与绑定查询、`field_ingest` 变化记录）：
+
+```bash
+bash examples/field_packages_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -851,6 +977,7 @@ app/
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
+  field_packages.py # 野外终端整包汇入：短号对照/绑定、稳定证据编号、整包核验与幂等
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
@@ -867,6 +994,7 @@ examples/
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
+  field_packages_demo.sh # 野外终端整包汇入示例（汇入/幂等/改绑/站点冲突/冲突回滚/编号占用）
   client_demo.py    # Python 客户端示例
 Dockerfile
 docker-compose.yml
