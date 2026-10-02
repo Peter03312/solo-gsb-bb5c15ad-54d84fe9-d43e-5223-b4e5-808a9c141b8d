@@ -142,7 +142,12 @@ def backfill_revision_changes(cur) -> int:
         after_assertions = _active_assertions_at(cur, revision)
         strata = [s for s, created in strata_created.items() if created <= applied_at]
         diffs = relation_diffs(strata, before_assertions, after_assertions)
-        source = "projection_merge" if isinstance(batch, dict) and batch.get("source") == "projection_merge" else "formal_batch"
+        if isinstance(batch, dict) and batch.get("source") == "projection_merge":
+            source = "projection_merge"
+        elif isinstance(batch, dict) and batch.get("source") == "field_package":
+            source = "field_package"
+        else:
+            source = "formal_batch"
         insert_revision_changes(cur, revision, diffs, source)
         prev_revision = revision
     return len(pending)

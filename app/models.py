@@ -107,6 +107,42 @@ class ArrangementIn(BaseModel):
     )
 
 
+class FieldMappingIn(BaseModel):
+    """短号到全库地层编号的一条对照。目标地层已登记时站点须与请求站点一致，
+    未登记时随包建立；同一终端的同一短号跨包不可改绑。"""
+
+    short_code: str = Field(min_length=1, max_length=128, description="终端本地地层短号（断言端点只能引用本包短号）")
+    stratum_id: str = Field(min_length=1, max_length=128, description="全库地层编号（已登记则站点须一致，否则随包建立）")
+
+
+class FieldAssertionIn(BaseModel):
+    """野外断言，端点为**本包短号**；seq 在包内唯一，
+    正式证据编号由 (终端编号, 包号, seq) 稳定确定。"""
+
+    seq: int = Field(ge=1, description="包内唯一序号（同一终端同一包号重试时保持不变）")
+    stratum_a: str = Field(min_length=1, max_length=128, description="端点短号 A（须出现在本包 mappings 中）")
+    stratum_b: str = Field(min_length=1, max_length=128, description="端点短号 B（须出现在本包 mappings 中）")
+    relation: Literal["same_period", "earlier_than"]
+
+
+class FieldPackageIn(BaseModel):
+    """野外终端离线整包汇入请求。
+
+    断言端点只能引用本包短号；目标地层已登记时站点须一致，未登记随包建立；
+    同一终端同一短号跨包不可改绑。整包沿用正式批次的最终关系核验，任一错误
+    都不落地层、绑定或断言；成功只递增一次正式修订。
+    相同终端 + 包号 + 内容重试幂等返回原结果（即使正式修订已前进）；
+    同终端同包号但内容不同拒绝。
+    """
+
+    site: str = Field(min_length=1, max_length=256, description="采集站点（与已登记目标的站点须一致）")
+    terminal_id: str = Field(min_length=1, max_length=128, description="终端编号")
+    package_no: str = Field(min_length=1, max_length=128, description="包号（终端内唯一）")
+    expected_revision: int = Field(ge=0, description="预期正式修订号；过期按 STALE_REVISION 拒绝（幂等重试除外）")
+    mappings: List[FieldMappingIn] = Field(min_length=1, description="短号到全库地层编号的对照（短号不可重复）")
+    assertions: List[FieldAssertionIn] = Field(min_length=1, description="带包内唯一序号的断言（端点只能用本包短号）")
+
+
 class ResilienceIn(BaseModel):
     """证据撤回承受力分析请求（只读，不写库、不递增修订号、不产生变化记录）。
 

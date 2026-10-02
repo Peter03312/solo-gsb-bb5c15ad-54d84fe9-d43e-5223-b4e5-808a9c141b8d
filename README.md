@@ -64,6 +64,30 @@
     （400 `DUPLICATE_STRATUM`）、受保护证据不存在或非生效
     （400 `INVALID_PROTECTED_EVIDENCE`，`details` 区分 `not_found` / `not_active`）明确拒绝；
     分析不改断言、修订或变化记录。
+- **野外终端离线整包汇入**：`POST /field-packages` 供无网络作业的终端回站后整包汇入。请求携带
+  采集站点 `site`、终端编号 `terminal_id`、包号 `package_no`、预期正式修订号
+  `expected_revision`、**短号→全库地层编号对照** `mappings[]` 与**带包内唯一序号**
+  `seq` 的同一期 / 早于断言 `assertions[]`：
+  - **断言端点只能引用本包短号**（400 `UNKNOWN_SHORT_CODE`）；包内短号不可重复
+    （400 `DUPLICATE_SHORT_CODE`）、序号不可重复（400 `DUPLICATE_SEQUENCE`）；
+  - **对照目标已登记时站点须一致**（409 `SITE_CONFLICT`），未登记时**随包建立**；
+    **同一终端的同一短号跨包不可改绑**（409 `SHORT_CODE_REBOUND`）；不同终端的短号空间互不影响；
+  - **证据编号由终端、包号、序号稳定确定**：`F:<base64url(终端)>:<base64url(包号)>:<12位序号>`
+    （同输入恒同号、不同输入不碰撞）；该编号不得占用已有证据编号（含已撤回，
+    409 `FIELD_EVIDENCE_TAKEN`）；
+  - **整包沿用正式批次的最终关系核验**：组内早于 / 早于闭环冲突时整批拒绝并返回冲突证据路径
+    （409 `FIELD_CONFLICT`）；**任一错误都不落地层、绑定或断言**（单事务回滚）；
+  - 通过时**只递增一次正式修订**，与关系变化记录、包台账**同事务提交**，响应返回短号映射
+    `mappings`（含每个目标是随包新建还是沿用已登记）、稳定证据编号清单 `evidence` 与修订号；
+  - **幂等**：相同终端 + 包号 + 内容（指纹不含 `expected_revision`，与数组顺序无关）重试
+    返回首次成功的原结果（`replayed=true`），**即使正式修订已前进、预期号已过期**；
+    同终端同包号但**异内容**复用拒绝（409 `FIELD_PACKAGE_CONTENT_MISMATCH`，双指纹）；
+    首次汇入仍做过期修订校验（409 `STALE_REVISION`）；失败不占包号，修正后可按原包号重提；
+  - 该修订的关系变化同样进入 `/revision-changes`，来源为 `field_package`。
+    台账可读：`GET /field-packages`（不带参数为摘要列表；同带
+    `?terminal_id=...&package_no=...` 为详情）或路径形式
+    `GET /field-packages/{terminal_id}/{package_no}`（终端/包号含 `/` 时用查询参数形式），
+    含内容指纹与首次响应，不存在返回 404 `FIELD_PACKAGE_NOT_FOUND`。
 
 ## 快速开始
 
@@ -101,6 +125,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/strata` | 登记地层 `{stratum_id, site?}` |
 | GET | `/strata` | 地层列表 |
 | POST | `/batches` | 提交一批断言新增/撤回（整批核验，成功原子递增修订号） |
+| POST | `/field-packages` | 野外终端离线整包汇入：短号对照建层/绑定、稳定证据编号、整批核验、幂等返回原结果 |
+| GET | `/field-packages` / `/field-packages/{terminal_id}/{package_no}` | 野外汇入包台账列表 / 详情（内容指纹与首次响应；终端或包号含 `/` 等路径保留字符时用 `/field-packages?terminal_id=...&package_no=...`） |
 | POST | `/batches/preflight` | 提交前只读预检：求消除冲突所需撤回的最少生效旧证据（预算 0～3），不落库 |
 | GET | `/revision` | 当前修订号 |
 | GET | `/assertions?status=active` | 断言列表 |
@@ -213,6 +239,118 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 把 `extra_retractions` 作为额外的 `{"op": "retract", ...}` 并入原批次后再提交正式批次，
 即可通过核验（示例见 `examples/preflight_demo.sh`）。
+
+### 野外终端离线整包汇入：`POST /field-packages`
+
+野外终端无网络时用**本地短号**记录地层关系，回站后一次性整包汇入正式库。请求体：
+
+```json
+{
+  "site": "西山坡",
+  "terminal_id": "T-07",
+  "package_no": "2026-09-01-03",
+  "expected_revision": 0,
+  "mappings": [
+    {"short_code": "s1", "stratum_id": "XSP-01"},
+    {"short_code": "s2", "stratum_id": "XSP-02"},
+    {"short_code": "s3", "stratum_id": "XSP-03"}
+  ],
+  "assertions": [
+    {"seq": 1, "stratum_a": "s1", "stratum_b": "s2", "relation": "same_period"},
+    {"seq": 2, "stratum_a": "s2", "stratum_b": "s3", "relation": "earlier_than"}
+  ]
+}
+```
+
+- `site`：采集站点。`mappings[]` 的对照目标**已登记**时其站点必须与之相等，否则
+  409 `SITE_CONFLICT`（`details` 同时给出 `registered_site` / `request_site`）；
+  目标**未登记时随本包建立**（站点取 `site`）；
+- `terminal_id` + `package_no`：终端内包号唯一，是幂等键；
+- `mappings[]`：短号→全库地层编号对照，包内短号不可重复（400 `DUPLICATE_SHORT_CODE`）；
+- `assertions[]`：每条带**包内唯一序号** `seq`（≥1，重复 400 `DUPLICATE_SEQUENCE`），
+  端点 `stratum_a` / `stratum_b` **只能引用本包 mappings 中的短号**
+  （否则 400 `UNKNOWN_SHORT_CODE`，`details` 带 `seq` 与 `short_code`）；
+- `expected_revision`：预期正式修订号。首次汇入过期返回 409 `STALE_REVISION`；
+  **幂等重试不检查修订号**。
+
+**稳定证据编号**：由终端、包号、序号确定性生成，同输入永远同号，可在离线端预计算：
+
+```
+F:<base64url(terminal_id)>:<base64url(package_no)>:<seq 补零 12 位>
+```
+
+例：终端 `T-07`、包号 `2026-09-01-03`、序号 1 →
+`F:VC0wNw:MjAyNi0wOS0wMS0wMw:000000000001`。若生成的编号已被历史断言占用（含已撤回），
+整包 409 `FIELD_EVIDENCE_TAKEN`，`details.occupied_evidence_ids` 列出全部碰撞编号。
+
+成功响应（整包核验通过、单事务提交，正式修订号恰好 +1）：
+
+```json
+{
+  "site": "西山坡",
+  "terminal_id": "T-07",
+  "package_no": "2026-09-01-03",
+  "revision": 1,
+  "mappings": [
+    {"short_code": "s1", "stratum_id": "XSP-01", "site": "西山坡", "already_registered": false},
+    {"short_code": "s2", "stratum_id": "XSP-02", "site": "西山坡", "already_registered": false},
+    {"short_code": "s3", "stratum_id": "XSP-03", "site": "西山坡", "already_registered": false}
+  ],
+  "evidence": [
+    {"seq": 1, "evidence_id": "F:VC0wNw:MjAyNi0wOS0wMS0wMw:000000000001",
+     "stratum_a": "XSP-01", "stratum_b": "XSP-02", "relation": "same_period"},
+    {"seq": 2, "evidence_id": "F:VC0wNw:MjAyNi0wOS0wMS0wMw:000000000002",
+     "stratum_a": "XSP-02", "stratum_b": "XSP-03", "relation": "earlier_than"}
+  ],
+  "applied": 2,
+  "relation_changes": 3,
+  "replayed": false
+}
+```
+
+- 冲突响应（HTTP 409 `FIELD_CONFLICT`，原状态不变——**地层、绑定、断言都不落地**），
+  `details.conflicts[]` 与正式批次一致，含组内早于 / 早于闭环的 `evidence_path`：
+
+```json
+{
+  "error": {
+    "code": "FIELD_CONFLICT",
+    "message": "野外整包与现有断言矛盾，整批拒绝，地层 / 绑定 / 断言均不落地",
+    "details": {
+      "terminal_id": "T-07",
+      "package_no": "2026-09-01-03",
+      "current_revision": 0,
+      "conflicts": [
+        {"type": "earlier_cycle", "message": "早于关系形成闭环: ...",
+         "evidence_path": ["F:VC0wNw:...:000000000001", "..."]}
+      ]
+    }
+  }
+}
+```
+
+**短号绑定的跨包规则**：`(终端, 短号) → 全库地层编号` 首次随成功的包建立；之后同一终端的
+后续包里该短号**必须仍对照同一目标**，否则 409 `SHORT_CODE_REBOUND`（`details` 给出
+`bound_stratum_id` / `bound_package_no` / `requested_stratum_id`）。沿用既有绑定时无需重复
+登记、不校验站点（地层与站点在建绑时已确认一致）。不同终端的短号各自独立。
+
+**幂等与复用**：内容指纹对 `site`、规范化（排序）后的 `mappings` / `assertions` 取 sha256，
+**不含 `expected_revision`、与数组顺序无关**。
+
+| 情形 | 结果 |
+| --- | --- |
+| 同终端 + 同包号 + 同内容重试（任何修订号、任何时机） | HTTP 200，返回**首次成功响应**原样（含原修订号、原证据编号），`replayed=true`，修订不再前进 |
+| 同终端 + 同包号 + 异内容 | 409 `FIELD_PACKAGE_CONTENT_MISMATCH`（`details` 给原指纹与本次指纹） |
+| 首次汇入携带过期修订号 | 409 `STALE_REVISION`（取当前修订号后重提即可） |
+| 汇入失败（任何校验 / 冲突） | 不占包号、不留任何数据；修正后可用原包号重提 |
+
+汇入产生的正式修订与正式批次完全同构：写入 `assertions` / `revisions` 审计（batch 带
+`source=field_package`）、修订号 +1、`/revision-changes` 中对应变化的 `source` 为
+`field_package`、定版 / 推演 / 查询等既有能力全部可见，无额外口径。
+
+```bash
+bash examples/field_packages_demo.sh
+```
 
 ### 关系查询响应
 
@@ -531,12 +669,22 @@ bash examples/arrangement_demo.sh
 | 400 | `NOT_ENOUGH_STRATA` | 成果包：少于两个地层编号 |
 | 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 / 分期试排：锚点地层重复 |
 | 404 | `PACKAGE_NOT_FOUND` | 成果包不存在 |
+| 400 | `UNKNOWN_SHORT_CODE` | 野外包：断言端点引用了本包未对照的短号（details 带 seq/short_code） |
+| 400 | `DUPLICATE_SHORT_CODE` | 野外包：包内短号对照重复 |
+| 400 | `DUPLICATE_SEQUENCE` | 野外包：包内断言序号重复 |
+| 409 | `SITE_CONFLICT` | 野外包：对照目标已登记且站点与本包不一致 |
+| 409 | `SHORT_CODE_REBOUND` | 野外包：同一终端的同一短号跨包被请求改绑到不同全库编号 |
+| 409 | `FIELD_EVIDENCE_TAKEN` | 野外包：稳定证据编号已被历史断言占用（含已撤回） |
+| 409 | `FIELD_CONFLICT` | 野外包：整包最终关系核验冲突（附证据路径），地层/绑定/断言均不落地 |
+| 409 | `FIELD_PACKAGE_CONTENT_MISMATCH` | 野外包：同终端同包号已以不同内容汇入，异内容复用拒绝 |
+| 404 | `FIELD_PACKAGE_NOT_FOUND` | 野外汇入包台账中不存在该终端 + 包号 |
 
 ## 正式修订关系变化追踪
 
 考古人员需要按正式修订追踪**关系结论及支撑证据**的变化。服务对每次成功的
-**正式断言批次**（`POST /batches`）与**推演并入产生的正式修订**
-（`POST /projections/{id}/merge` 且实际递增修订号）记录变化明细。
+**正式断言批次**（`POST /batches`）、**推演并入产生的正式修订**
+（`POST /projections/{id}/merge` 且实际递增修订号）与**野外整包汇入产生的正式修订**
+（`POST /field-packages`）记录变化明细。
 
 **记录口径**
 
@@ -594,7 +742,7 @@ bash examples/arrangement_demo.sh
 ```
 
 `source`：`formal_batch`（正式断言批次）/ `projection_merge`（推演并入产生的
-正式修订）。
+正式修订）/ `field_package`（野外整包汇入产生的正式修订）。
 
 **历史修订可追溯**：服务启动时幂等检查 `revisions` 审计，对部署前已存在、尚未
 追踪的历史修订按当时断言集（`added_revision` / `retracted_revision` 回放）重算
@@ -835,6 +983,14 @@ bash examples/changes_demo.sh
 bash examples/packages_demo.sh
 ```
 
+野外终端离线整包汇入演示（短号随包建层与跨包绑定、稳定证据编号、整包核验附冲突路径、
+同包同内容幂等返回原结果 / 异内容拒绝、未知短号 / 重复序号 / 站点冲突 / 改绑 /
+过期修订明确报错）：
+
+```bash
+bash examples/field_packages_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -848,6 +1004,7 @@ python3 examples/client_demo.py
 app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
+  field.py        # 野外终端离线整包汇入：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
@@ -867,6 +1024,7 @@ examples/
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
+  field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
   client_demo.py    # Python 客户端示例
 Dockerfile
 docker-compose.yml

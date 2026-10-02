@@ -160,6 +160,54 @@ CREATE TABLE IF NOT EXISTS thematic_packages (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (version, strata_key)
 );
+
+-- 野外终端短号绑定：同一终端的同一短号首次随包建立，之后跨包不可改绑。
+-- 目标为全库地层编号；目标地层在汇入成功事务内登记（站点随包）或沿用既有登记。
+CREATE TABLE IF NOT EXISTS field_short_bindings (
+    terminal_id    TEXT NOT NULL,
+    short_code     TEXT NOT NULL,
+    stratum_id     TEXT NOT NULL,
+    site           TEXT NOT NULL,                          -- 建立绑定时的采集站点（留痕）
+    package_no     TEXT NOT NULL,                          -- 首次建立绑定的包号
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, short_code)
+);
+
+-- 野外离线整包汇入台账（幂等）：相同终端 + 包号只成功一次；
+-- content_hash 为除 expected_revision 外包内容的规范指纹：
+-- 同内容重试（即使正式修订已前进）原样返回 stored_response；异内容拒绝。
+CREATE TABLE IF NOT EXISTS field_packages (
+    terminal_id       TEXT NOT NULL,
+    package_no        TEXT NOT NULL,
+    site              TEXT NOT NULL,
+    content_hash      TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,                    -- 首次成功时携带的预期修订号
+    applied_revision  INTEGER NOT NULL,                    -- 实际递增到的正式修订号
+    mappings          JSONB NOT NULL,                      -- 规范化后的短号对照
+    evidence          JSONB NOT NULL,                      -- seq -> 稳定证据编号
+    request           JSONB NOT NULL,                      -- 规范化请求留痕
+    stored_response   JSONB NOT NULL,                      -- 首次成功响应（重试原样返回）
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, package_no)
+);
+"""
+
+# revision_changes.source 增加 field_package（野外整包汇入）。
+# 约束放宽是幂等的：全新库的上面 CREATE 已带三值 CHECK，DO 块检测到一致即跳过。
+SCHEMA += """
+DO $$
+DECLARE
+    c TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO c
+    FROM pg_constraint
+    WHERE conrelid = 'revision_changes'::regclass AND conname = 'revision_changes_source_check';
+    IF c IS NOT NULL AND c NOT LIKE '%field_package%' THEN
+        ALTER TABLE revision_changes DROP CONSTRAINT revision_changes_source_check;
+        ALTER TABLE revision_changes ADD CONSTRAINT revision_changes_source_check
+            CHECK (source IN ('formal_batch', 'projection_merge', 'field_package'));
+    END IF;
+END$$;
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None

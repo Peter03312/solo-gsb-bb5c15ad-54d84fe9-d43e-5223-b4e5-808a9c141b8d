@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
+from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,12 +19,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
+        "支持野外终端离线短号记录的整包汇入（/field-packages）："
+        "短号对照随包建立地层与跨包不可改绑的终端绑定，证据编号由终端/包号/序号稳定确定，"
+        "整包最终关系核验、原子递增一次正式修订，同终端同包号内容重试幂等返回原结果；"
         "支持只读分期骨架视图（/periodization）：同一期等价组与组间传递约简后的直接早于边；"
         "支持只读分期试排（/periodization/arrangement 与 /projections/{id}/periodization/arrangement）："
         "在总期数（1～64）与地层期位锚点约束下，返回每个同一期等价组在所有可行排布中的最早/最晚期位，"
@@ -149,6 +152,62 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
                 }
                 for r in cur.fetchall()
             ]
+
+
+# ------------------------------------------------------------------ 野外终端离线整包汇入
+@app.post("/field-packages", tags=["field-packages"])
+def post_field_package(body: FieldPackageIn):
+    """野外终端离线记录整包汇入正式库（整批核验、原子提交）。
+
+    - 请求带采集站点、终端编号、包号、预期正式修订号、短号→全库地层编号对照
+      及带包内唯一序号的同一期 / 早于断言；断言端点只能引用本包短号
+      （400 UNKNOWN_SHORT_CODE / DUPLICATE_SHORT_CODE / DUPLICATE_SEQUENCE）；
+    - 对照目标已登记时站点须一致（409 SITE_CONFLICT），未登记随包建立；
+      同一终端同一短号跨包不可改绑（409 SHORT_CODE_REBOUND）；
+    - 证据编号由 (终端, 包号, 序号) 稳定确定且不得占用已有编号
+      （409 FIELD_EVIDENCE_TAKEN）；
+    - 整包沿用正式批次的最终关系核验，冲突 409 FIELD_CONFLICT 附证据路径；
+      任一错误都不落地层、绑定或断言；
+    - 成功只递增一次正式修订，并与变化记录同事务提交，返回短号映射、
+      证据编号与修订号；
+    - 相同终端 + 包号 + 内容重试返回原结果（replayed=true），即使正式修订
+      已前进；异内容复用 409 FIELD_PACKAGE_CONTENT_MISMATCH；
+      首次汇入的过期修订 409 STALE_REVISION。
+    """
+    return field_svc.ingest_field_package(body)
+
+
+@app.get("/field-packages", tags=["field-packages"])
+def list_field_packages(
+    terminal_id: Optional[str] = Query(default=None, description="终端编号（与 package_no 同时给出时返回该包详情）"),
+    package_no: Optional[str] = Query(default=None, description="包号（与 terminal_id 同时给出时返回该包详情）"),
+):
+    """已成功汇入的野外整包台账。
+
+    - 不带参数：台账摘要列表；
+    - 同时给 terminal_id 与 package_no：返回该包详情（终端 / 包号含 '/' 等
+      不便放入路径段的字符时用此形式），不存在 404 FIELD_PACKAGE_NOT_FOUND。
+    """
+    if terminal_id is not None and package_no is not None:
+        return field_svc.get_field_package(terminal_id, package_no)
+    if terminal_id is not None or package_no is not None:
+        raise ApiError(
+            400,
+            "INVALID_QUERY",
+            "terminal_id 与 package_no 须同时提供",
+            {"terminal_id": terminal_id, "package_no": package_no},
+        )
+    return field_svc.list_field_packages()
+
+
+@app.get("/field-packages/{terminal_id}/{package_no}", tags=["field-packages"])
+def get_field_package(terminal_id: str, package_no: str):
+    """野外整包汇入详情：短号映射、稳定证据编号、首次成功响应（不存在 404）。
+
+    终端编号 / 包号含 '/' 等路径保留字符时改用
+    `GET /field-packages?terminal_id=...&package_no=...`。
+    """
+    return field_svc.get_field_package(terminal_id, package_no)
 
 
 # ------------------------------------------------------------------ 关系查询
