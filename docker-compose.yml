@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-strat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strat}
+      POSTGRES_DB: ${POSTGRES_DB:-stratigraphy}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-strat}:${POSTGRES_PASSWORD:-strat}@db:5432/${POSTGRES_DB:-stratigraphy}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
